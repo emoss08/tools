@@ -6,6 +6,7 @@ package cache
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"sync"
 	"time"
@@ -33,10 +34,16 @@ func newMemoizedFS() *memoizedFS {
 
 // A diskFile is a file in the filesystem, or a failure to read one.
 // It implements the file.Source interface.
+//
+// A diskFile does not hold the file's content: snapshots keep a handle for
+// every file in the workspace, and most of them are only read again on a cache
+// miss, so holding every file's bytes would cost as much memory as the source
+// tree. Content rereads the file and checks it against the hash taken when the
+// handle was created.
 type diskFile struct {
 	uri     protocol.DocumentURI
 	modTime time.Time
-	content []byte
+	size    int
 	hash    file.Hash
 	err     error
 }
@@ -54,8 +61,25 @@ func (h *diskFile) Identity() file.Identity {
 
 func (h *diskFile) SameContentsOnDisk() bool    { return true }
 func (h *diskFile) Version() int32              { return 0 }
-func (h *diskFile) Content() ([]byte, error)    { return h.content, h.err }
 func (h *diskFile) ModTime() (time.Time, error) { return h.modTime, h.err }
+
+// Content rereads the file. It reports an error, rather than returning
+// content that does not match the handle's hash, if the file changed after the
+// handle was created: results derived from content are cached by hash, and the
+// client reports the change, which replaces the handle.
+func (h *diskFile) Content() ([]byte, error) {
+	if h.err != nil {
+		return nil, h.err
+	}
+	content, err := readContent(h.uri)
+	if err != nil {
+		return nil, err
+	}
+	if file.HashOf(content) != h.hash {
+		return nil, fmt.Errorf("%s changed on disk after it was read", h.uri.Path())
+	}
+	return content, nil
+}
 
 // ReadFile stats and (maybe) reads the file, updates the cache, and returns it.
 func (fs *memoizedFS) ReadFile(ctx context.Context, uri protocol.DocumentURI) (file.Handle, error) {
@@ -131,8 +155,8 @@ func (fs *memoizedFS) fileStats() (files, largest, errs int) {
 
 	for _, files := range fs.filesByID {
 		rep := files[0]
-		if len(rep.content) > largest {
-			largest = len(rep.content)
+		if rep.size > largest {
+			largest = rep.size
 		}
 		if rep.err != nil {
 			errs++
@@ -167,8 +191,16 @@ func readFile(ctx context.Context, uri protocol.DocumentURI, mtime time.Time) (*
 	return &diskFile{
 		modTime: mtime,
 		uri:     uri,
-		content: content,
+		size:    len(content),
 		hash:    file.HashOf(content),
 		err:     err,
 	}, nil
+}
+
+// readContent rereads a file for diskFile.Content, sharing the limit on
+// parallel reads.
+func readContent(uri protocol.DocumentURI) ([]byte, error) {
+	ioLimit <- struct{}{}
+	defer func() { <-ioLimit }()
+	return os.ReadFile(uri.Path())
 }
