@@ -6,6 +6,8 @@ package cache
 
 import (
 	"reflect"
+	"runtime"
+	"runtime/metrics"
 	"strconv"
 	"sync/atomic"
 
@@ -58,7 +60,36 @@ import (
 //
 // For more details on this technique, see:
 // https://blog.twitch.tv/en/2019/04/10/go-memory-ballast-how-i-learnt-to-stop-worrying-and-love-the-heap/
-var ballast = make([]byte, 100*1e6)
+//
+// The ballast is released once the rest of the live heap is at least as large
+// as it is: GC pacing then keeps collections infrequent on its own, and the
+// ballast would only raise the heap goal, which costs RAM in large workspaces
+// and counts against GOMEMLIMIT when the user sets one.
+var ballast = make([]byte, ballastSize)
+
+const ballastSize = 100 * 1e6
+
+func init() { releaseBallastWhenOutgrown() }
+
+// releaseBallastWhenOutgrown checks the live heap after each GC cycle, using a
+// cleanup on an unreachable sentinel, and drops the ballast once it no longer
+// dominates the heap.
+func releaseBallastWhenOutgrown() {
+	sentinel := new(gcSentinel)
+	runtime.AddCleanup(sentinel, func(struct{}) {
+		live := []metrics.Sample{{Name: "/gc/heap/live:bytes"}}
+		metrics.Read(live)
+		if live[0].Value.Kind() == metrics.KindUint64 && live[0].Value.Uint64() >= 2*ballastSize {
+			ballast = nil
+			return
+		}
+		releaseBallastWhenOutgrown()
+	}, struct{}{})
+}
+
+// gcSentinel holds a pointer so that it is never batched by the tiny
+// allocator, whose blocks may never be collected.
+type gcSentinel struct{ _ *byte }
 
 // New Creates a new cache for gopls operation results, using the given file
 // set, shared store, and session options.
