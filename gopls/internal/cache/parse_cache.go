@@ -71,6 +71,16 @@ const (
 	// Always keep 100 recent files, independent of their wall-clock age, to
 	// optimize the case where the user resumes editing after a delay.
 	parseCacheMinFiles = 100
+
+	// Beyond parseCacheMinFiles, evict the least recently used files as soon
+	// as the cached source exceeds this many bytes, independent of their age.
+	// Syntax trees are many times larger than their source, and type-checking
+	// a large workspace from scratch parses every file in less than the expiry
+	// time: without a size bound, every syntax tree of the workspace stays in
+	// memory at once (3.5GB of a 4.9GB heap in one workspace with 96MB of Go
+	// source). The cache exists to avoid reparsing the open package while the
+	// user types, which this budget covers.
+	parseCacheMaxBytes = 8 << 20
 )
 
 // parsePadding is additional padding allocated to allow for increases in
@@ -103,6 +113,8 @@ type parseCache struct {
 	lru      queue  // min-atime priority queue of *parseCacheEntry
 	clock    uint64 // clock time, incremented when the cache is updated
 	nextBase int    // base offset for the next parsed file
+	size     int    // total source bytes of the cached files
+	maxBytes int    // size above which least recently used files are evicted
 }
 
 // newParseCache creates a new parse cache and starts a goroutine to garbage
@@ -112,6 +124,7 @@ type parseCache struct {
 func newParseCache(expireAfter time.Duration) *parseCache {
 	c := &parseCache{
 		expireAfter: expireAfter,
+		maxBytes:    parseCacheMaxBytes,
 		m:           make(map[parseKey]*parseCacheEntry),
 		done:        make(chan struct{}),
 	}
@@ -137,6 +150,7 @@ type parseCacheEntry struct {
 	promise  *memoize.Promise // memoize.Promise[*parsego.File]
 	atime    uint64           // clock time of last access, for use in LRU sorting
 	walltime time.Time        // actual time of last access, for use in time-based eviction; too coarse for LRU on some systems
+	size     int              // source bytes
 	lruIndex int              // owned by the queue implementation
 }
 
@@ -190,6 +204,7 @@ func (c *parseCache) startParse(mode parser.Mode, purgeFuncBodies bool, fhs ...f
 				// A cache hit, for a different version. Delete it.
 				delete(c.m, e.key)
 				heap.Remove(&c.lru, e.lruIndex)
+				c.size -= e.size
 			}
 		}
 
@@ -240,10 +255,13 @@ func (c *parseCache) startParse(mode parser.Mode, purgeFuncBodies bool, fhs ...f
 			promise:  promise,
 			atime:    c.clock,
 			walltime: walltime,
+			size:     len(content),
 		}
 		c.m[e.key] = e
 		heap.Push(&c.lru, e)
+		c.size += e.size
 	}
+	c.evictOverBudget()
 
 	if len(c.m) != len(c.lru) {
 		panic("map and LRU are inconsistent")
@@ -277,10 +295,30 @@ func (c *parseCache) gcOnce() {
 		e := heap.Pop(&c.lru).(*parseCacheEntry)
 		if now.Sub(e.walltime) >= c.expireAfter {
 			delete(c.m, e.key)
+			c.size -= e.size
 		} else {
 			heap.Push(&c.lru, e)
 			break
 		}
+	}
+}
+
+// evictOverBudget evicts the least recently used files, beyond
+// parseCacheMinFiles, while the cached source exceeds c.maxBytes. Files of
+// the current parsing pass are kept, so that a package larger than the budget
+// is still cached while the user types in it. Evicting an entry only drops the
+// cache's reference: callers holding its promise still get its result.
+//
+// c.mu must be held.
+func (c *parseCache) evictOverBudget() {
+	for len(c.m) > parseCacheMinFiles && c.size > c.maxBytes {
+		e := heap.Pop(&c.lru).(*parseCacheEntry)
+		if e.atime == c.clock {
+			heap.Push(&c.lru, e)
+			return
+		}
+		delete(c.m, e.key)
+		c.size -= e.size
 	}
 }
 

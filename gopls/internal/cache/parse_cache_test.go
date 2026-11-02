@@ -193,6 +193,72 @@ func TestParseCache_Duplicates(t *testing.T) {
 	}
 }
 
+func TestParseCache_SizeEviction(t *testing.T) {
+	skipIfNoParseCache(t)
+
+	ctx := context.Background()
+	fset := token.NewFileSet()
+	cache := newParseCache(time.Hour)
+	defer cache.stop()
+	cache.maxBytes = 1
+
+	files := dummyFileHandles(parseCacheMinFiles + 50)
+	first, err := cache.parseFiles(ctx, fset, parsego.Full, false, files[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var last []*parsego.File
+	for _, fh := range files[1:] {
+		if last, err = cache.parseFiles(ctx, fset, parsego.Full, false, fh); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := len(cache.m); got != parseCacheMinFiles {
+		t.Errorf("after parsing %d files one at a time over budget: %d cached, want %d", len(files), got, parseCacheMinFiles)
+	}
+	checkParseCacheSize(t, cache)
+
+	again, err := cache.parseFiles(ctx, fset, parsego.Full, false, files[len(files)-1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again[0] != last[0] {
+		t.Error("most recently parsed file was evicted")
+	}
+	again, err = cache.parseFiles(ctx, fset, parsego.Full, false, files[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again[0] == first[0] {
+		t.Error("least recently parsed file was not evicted")
+	}
+	checkParseCacheSize(t, cache)
+
+	// A single pass larger than the budget stays cached.
+	batch := dummyFileHandles(parseCacheMinFiles + 300)[parseCacheMinFiles+50:]
+	if _, err := cache.parseFiles(ctx, fset, parsego.Full, false, batch...); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(cache.m); got < len(batch) {
+		t.Errorf("after parsing %d files in one pass: %d cached, want at least %d", len(batch), got, len(batch))
+	}
+	checkParseCacheSize(t, cache)
+}
+
+func checkParseCacheSize(t *testing.T, cache *parseCache) {
+	t.Helper()
+	total := 0
+	for _, e := range cache.m {
+		total += e.size
+	}
+	if total != cache.size {
+		t.Errorf("cache.size = %d, want the sum of entry sizes %d", cache.size, total)
+	}
+	if len(cache.m) != len(cache.lru) {
+		t.Errorf("map has %d entries, LRU queue %d", len(cache.m), len(cache.lru))
+	}
+}
+
 func dummyFileHandles(n int) []file.Handle {
 	var fhs []file.Handle
 	for i := range n {
